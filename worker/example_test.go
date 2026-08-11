@@ -2,7 +2,7 @@ package worker_test
 
 import (
 	"fmt"
-	"github.com/mikespook/gearman-go/worker"
+	"github.com/nook24/gearman-go/worker"
 	"sync"
 )
 
