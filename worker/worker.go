@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,11 +19,22 @@ const (
 // It can connect to multi-server and grab jobs.
 type Worker struct {
 	sync.Mutex
-	agents  []*agent
-	funcs   jobFuncs
-	in      chan *inPack
-	running bool
-	ready   bool
+	agents []*agent
+	funcs  jobFuncs
+	in     chan *inPack
+	ready  bool
+
+	// running is read from exec on the job goroutines while Close writes
+	// it, so it cannot be a plain bool guarded only by the worker mutex -
+	// exec does not hold that mutex.
+	running atomic.Bool
+
+	// agentWG counts the per-connection agent goroutines that send on
+	// worker.in. Close waits on it before closing that channel: without
+	// it, closing races the agents' sends, which is a data race and a
+	// "send on closed channel" panic in a goroutine the caller does not
+	// own and cannot recover from.
+	agentWG sync.WaitGroup
 
 	Id           string
 	ErrorHandler ErrorHandler
@@ -86,7 +98,7 @@ func (worker *Worker) AddFunc(funcname string,
 		return fmt.Errorf("The function already exists: %s", funcname)
 	}
 	worker.funcs[funcname] = &jobFunc{f: f, timeout: timeout}
-	if worker.running {
+	if worker.running.Load() {
 		worker.addFunc(funcname, timeout)
 	}
 	return
@@ -124,7 +136,7 @@ func (worker *Worker) RemoveFunc(funcname string) (err error) {
 		return fmt.Errorf("The function does not exist: %s", funcname)
 	}
 	delete(worker.funcs, funcname)
-	if worker.running {
+	if worker.running.Load() {
 		worker.removeFunc(funcname)
 	}
 	return
@@ -198,7 +210,7 @@ func (worker *Worker) Work() {
 	}
 
 	worker.Lock()
-	worker.running = true
+	worker.running.Store(true)
 	worker.Unlock()
 
 	for _, a := range worker.agents {
@@ -222,14 +234,38 @@ func (worker *Worker) customeHandler(inpack *inPack) {
 // Close connection and exit main loop
 func (worker *Worker) Close() {
 	worker.Lock()
-	defer worker.Unlock()
-	if worker.running == true {
-		for _, a := range worker.agents {
-			a.Close()
-		}
-		worker.running = false
-		close(worker.in)
+	if !worker.running.Load() {
+		worker.Unlock()
+		return
 	}
+	worker.running.Store(false)
+	agents := make([]*agent, len(worker.agents))
+	copy(agents, worker.agents)
+	worker.Unlock()
+
+	// Closing an agent's connection makes its read fail, which is how
+	// its work() goroutine breaks out of the read loop and returns.
+	for _, a := range agents {
+		a.Close()
+	}
+
+	// An agent sitting in "worker.in <- inpack" can only return once
+	// somebody receives that packet. Work() normally does, but it may
+	// itself be parked on the concurrency limit, so drain here too -
+	// otherwise the wait below could sit out an in-flight job's runtime.
+	// Packets picked up here are dropped, which is what closing means.
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range worker.in {
+		}
+	}()
+
+	// The whole point: no agent can still be sending by the time the
+	// channel is closed.
+	worker.agentWG.Wait()
+	close(worker.in)
+	<-drained
 }
 
 // Echo
@@ -283,7 +319,7 @@ func (worker *Worker) exec(inpack *inPack) (err error) {
 	} else {
 		r = execTimeout(f.f, inpack, time.Duration(f.timeout)*time.Second)
 	}
-	if worker.running {
+	if worker.running.Load() {
 		outpack := getOutPack()
 		if r.err == nil {
 			outpack.dataType = dtWorkComplete

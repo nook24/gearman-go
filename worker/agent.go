@@ -39,11 +39,15 @@ func (a *agent) Connect() (err error) {
 	}
 	a.rw = bufio.NewReadWriter(bufio.NewReader(a.conn),
 		bufio.NewWriter(a.conn))
+	a.worker.agentWG.Add(1)
 	go a.work()
 	return
 }
 
 func (a *agent) work() {
+	// Paired with the Add in Connect/reconnect. Worker.Close waits on
+	// this before closing worker.in, which this goroutine sends on.
+	defer a.worker.agentWG.Done()
 	defer func() {
 		if err := recover(); err != nil {
 			a.worker.err(err.(error))
@@ -166,6 +170,7 @@ func (a *agent) reconnect() error {
 	a.worker.reRegisterFuncsForAgent(a)
 	a.grab()
 
+	a.worker.agentWG.Add(1)
 	go a.work()
 	return nil
 }
