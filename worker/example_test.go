@@ -1,22 +1,26 @@
-package worker_test
+// Kept in package worker rather than worker_test: an external test
+// package has to import this module by its own path, and a module that
+// imports itself cannot be consumed through a replace directive - go
+// mod tidy in the consumer then reports the module being "used for two
+// different module paths".
+package worker
 
 import (
 	"fmt"
-	"github.com/nook24/gearman-go/worker"
 	"sync"
 )
 
 func ExampleWorker() {
 	// An example of worker
-	w := worker.New(worker.Unlimited)
+	w := New(Unlimited)
 	defer w.Close()
 	// Add a gearman job server
-	if err := w.AddServer(worker.Network, "127.0.0.1:4730"); err != nil {
+	if err := w.AddServer(Network, "127.0.0.1:4730"); err != nil {
 		fmt.Println(err)
 		return
 	}
 	// A function for handling jobs
-	foobar := func(job worker.Job) ([]byte, error) {
+	foobar := func(job Job) ([]byte, error) {
 		// Do nothing here
 		return nil, nil
 	}
@@ -27,7 +31,7 @@ func ExampleWorker() {
 	}
 	var wg sync.WaitGroup
 	// A custome handler, for handling other results, eg. ECHO, dtError.
-	w.JobHandler = func(job worker.Job) error {
+	w.JobHandler = func(job Job) error {
 		if job.Err() == nil {
 			fmt.Println(string(job.Data()))
 		} else {
