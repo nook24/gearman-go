@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.19 is the floor: worker.running is an atomic.Bool, which was
+        # added to sync/atomic in Go 1.19.
+        go: ['1.19', 'stable']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Install gearman job server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gearman-job-server
+          sudo systemctl start gearman-job-server || gearmand --listen=127.0.0.1 --port=4730 -d
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/4730) 2>/dev/null; then
+              echo "gearmand is listening on 4730"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "gearmand did not come up on 127.0.0.1:4730" >&2
+          exit 1
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race ./...
+
+      # The race detector against a real job server is what found the
+      # Worker.Close data race this fork exists for, so it runs here.
+      #
+      # Only ./worker/...: the client integration tests expect workers to
+      # be registered for the functions they call, and TestClientMultiDo
+      # needs example/pl/worker_multi.pl running. They hang against a
+      # bare gearmand.
+      #
+      # -integration comes after the package list on purpose: it is a
+      # flag of the test binary, not of go test, and an unknown flag
+      # ends the package list - "go test -integration ./worker/..."
+      # would test the current directory and silently run nothing.
+      - name: go test (integration, race)
+        run: go test -race -timeout 5m ./worker/... -integration
