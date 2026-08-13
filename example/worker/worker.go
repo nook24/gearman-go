@@ -4,11 +4,12 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/nook24/gearman-go/worker"
-	"github.com/mikespook/golib/signal"
 )
 
 func ToUpper(job worker.Job) ([]byte, error) {
@@ -69,6 +70,9 @@ func main() {
 		return
 	}
 	go w.Work()
-	signal.Bind(os.Interrupt, func() uint { return signal.BreakExit })
-	signal.Wait()
+	// Wait for a signal. The ErrorHandler above sends us an interrupt
+	// when the connection to the job server is gone for good.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	<-sig
 }
