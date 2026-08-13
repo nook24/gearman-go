@@ -250,7 +250,6 @@ func (client *Client) do(funcname string, data []byte,
 		client.innerHandler.remove("c")
 		return "", ErrLostConn
 	}
-	return
 }
 
 // Call the function and get a response.

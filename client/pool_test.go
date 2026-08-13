@@ -132,8 +132,11 @@ func TestPoolClose(t *testing.T) {
 	if !runIntegrationTests {
 		t.Skip("To run this test, use: go test -integration")
 	}
-	return
-	if err := pool.Close(); err != nil {
-		t.Error(err)
+	// Close reports one error per client, keyed by address; the map
+	// itself is always non-nil, so check the entries.
+	for addr, err := range pool.Close() {
+		if err != nil {
+			t.Errorf("%s: %s", addr, err)
+		}
 	}
 }
