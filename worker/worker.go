@@ -22,7 +22,12 @@ type Worker struct {
 	agents []*agent
 	funcs  jobFuncs
 	in     chan *inPack
-	ready  bool
+	// ready is written by Ready and read by Work, which callers routinely
+	// run on different goroutines - Work calls Ready itself when it was
+	// not called beforehand. Atomic for the same reason running is: a
+	// plain bool here is a data race the detector flags as soon as
+	// anything observes the worker coming up.
+	ready atomic.Bool
 
 	// running is read from exec on the job goroutines while Close writes
 	// it, so it cannot be a plain bool guarded only by the worker mutex -
@@ -194,14 +199,14 @@ func (worker *Worker) Ready() (err error) {
 	for funcname, f := range worker.funcs {
 		worker.addFunc(funcname, f.timeout)
 	}
-	worker.ready = true
+	worker.ready.Store(true)
 	return
 }
 
 // Work start main loop (blocking)
 // Most of time, this should be evaluated in goroutine.
 func (worker *Worker) Work() {
-	if !worker.ready {
+	if !worker.ready.Load() {
 		// didn't run Ready beforehand, so we'll have to do it:
 		err := worker.Ready()
 		if err != nil {
