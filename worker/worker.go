@@ -41,6 +41,25 @@ type Worker struct {
 	// own and cannot recover from.
 	agentWG sync.WaitGroup
 
+	// draining is set by Close before anything is torn down. While it is
+	// set, handleInPack starts no new jobs and stops asking the servers
+	// for more, but the connections stay open so the jobs already running
+	// can still report their result.
+	draining atomic.Bool
+
+	// execWG counts the job goroutines handleInPack starts. Close waits on
+	// it while running is still true, which is what allows exec to send
+	// WORK_COMPLETE for those jobs.
+	//
+	// Without this, a job in flight when Close is called finishes its work
+	// and then silently skips its acknowledgement, because exec only
+	// writes the response while running is true. The server never hears
+	// that the job completed, so on disconnect it re-queues it and hands
+	// it to the next worker that connects. The job is then executed twice
+	// - once invisibly - which for anything that is not idempotent means
+	// duplicated or, if the second run collides with the first, lost work.
+	execWG sync.WaitGroup
+
 	Id           string
 	ErrorHandler ErrorHandler
 	JobHandler   JobHandler
@@ -163,7 +182,15 @@ func (worker *Worker) handleInPack(inpack *inPack) {
 	case dtNoop:
 		inpack.a.Grab()
 	case dtJobAssign, dtJobAssignUniq:
+		// Close is already draining: do not start this job, and do not ask
+		// for another. The job was never begun, so leaving it unanswered is
+		// correct - the server re-queues it and a later worker runs it once.
+		if worker.draining.Load() {
+			return
+		}
+		worker.execWG.Add(1)
 		go func() {
+			defer worker.execWG.Done()
 			if err := worker.exec(inpack); err != nil {
 				worker.err(err)
 			}
@@ -236,17 +263,42 @@ func (worker *Worker) customeHandler(inpack *inPack) {
 	}
 }
 
-// Close connection and exit main loop
+// DrainTimeout bounds how long Close waits for jobs that are already
+// running to report their result. A handler that never returns must not
+// turn a shutdown into a hang; once this elapses the remaining jobs lose
+// their acknowledgement and the server will hand them out again, which is
+// exactly what happened to every in-flight job before draining existed.
+var DrainTimeout = 30 * time.Second
+
+// Close stops the worker: it lets the jobs that are already running finish
+// and acknowledge, then disconnects and exits the main loop.
+//
+// The order matters and is the opposite of what it used to be. Marking the
+// worker as not running, or closing the connections, before those jobs
+// report back means exec silently skips their WORK_COMPLETE - the server
+// never learns they finished, re-queues them on disconnect and hands them
+// to the next worker, so each is executed twice with the first run
+// invisible to the client.
 func (worker *Worker) Close() {
 	worker.Lock()
-	if !worker.running.Load() {
+	if !worker.running.Load() || worker.draining.Load() {
 		worker.Unlock()
 		return
 	}
-	worker.running.Store(false)
+	// Not running=false yet: exec checks that flag before writing a job's
+	// response, so it has to stay true until the jobs below are done.
+	// draining is what stops new ones from starting in the meantime, and
+	// it doubles as the guard against a second concurrent Close.
+	worker.draining.Store(true)
 	agents := make([]*agent, len(worker.agents))
 	copy(agents, worker.agents)
 	worker.Unlock()
+
+	if !waitTimeout(&worker.execWG, DrainTimeout) {
+		worker.err(ErrDrainTimeout)
+	}
+
+	worker.running.Store(false)
 
 	// Closing an agent's connection makes its read fail, which is how
 	// its work() goroutine breaks out of the read loop and returns.
@@ -271,6 +323,29 @@ func (worker *Worker) Close() {
 	worker.agentWG.Wait()
 	close(worker.in)
 	<-drained
+}
+
+// waitTimeout waits for wg, reporting false if d elapses first.
+//
+// The helper goroutine outlives a timed-out call until the WaitGroup does
+// reach zero. That is deliberate: it only holds a channel, and blocking
+// Close on a job that may never return would be the worse trade.
+func waitTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // Echo

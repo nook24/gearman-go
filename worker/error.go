@@ -11,6 +11,11 @@ var (
 	ErrNoneFuncs  = errors.New("None functions")
 	ErrTimeOut    = errors.New("Executing time out")
 	ErrUnknown    = errors.New("Unknown error")
+
+	// ErrDrainTimeout is reported to the ErrorHandler when Close gave up
+	// waiting for jobs that were still running. Those jobs never sent an
+	// acknowledgement, so the server will hand them out again.
+	ErrDrainTimeout = errors.New("Timed out waiting for running jobs to finish")
 )
 
 // Extract the error message
