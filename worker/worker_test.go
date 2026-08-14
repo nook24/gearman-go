@@ -19,12 +19,17 @@ func init() {
 }
 
 func TestMain(m *testing.M) {
-	integrationsTestFlag := flag.Bool("integration", false, "Run the integration tests (in addition to the unit tests)")
-	if integrationsTestFlag != nil {
-		runIntegrationTests = *integrationsTestFlag
-	}
-	code := m.Run()
-	os.Exit(code)
+	// BoolVar plus an explicit Parse, because the flag has to be read
+	// after parsing, not before. This used to dereference the pointer
+	// flag.Bool returns straight away - m.Run is what calls flag.Parse,
+	// so the value read was always the default. Every test gated on
+	// runIntegrationTests therefore skipped no matter what was passed on
+	// the command line, in CI included.
+	flag.BoolVar(&runIntegrationTests, "integration", false,
+		"Run the integration tests (in addition to the unit tests)")
+	flag.Parse()
+
+	os.Exit(m.Run())
 }
 
 func TestWorkerErrNoneAgents(t *testing.T) {
