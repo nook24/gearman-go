@@ -21,11 +21,44 @@ This is a maintained fork of [mikespook/gearman-go](https://github.com/mikespook
 ## Why this fork exists
 
 Upstream has had no commits since May 2022. This fork carries the fixes that
-came out of running the library in production, starting with a data race in
-`Worker.Close()`:
+came out of running the library in production. Two of them are in
+`Worker.Close()`, which is where the interesting bugs turned out to live; the
+third is the reason nobody had found them earlier.
 
-`Close()` closed the `worker.in` channel while the per-connection agent
-goroutines were still sending job packets on it. The race detector flags this
+### Jobs still running were never acknowledged
+
+The one with visible consequences for your data. `Close()` cleared `running`
+and closed every agent connection *before* waiting for anything, and `exec`
+writes a job's `WORK_COMPLETE` only while `running` is true. Every job still
+executing at that moment therefore finished its work and then silently skipped
+its acknowledgement.
+
+The job server never learned those jobs had completed, so on disconnect it
+re-queued them and handed them to the next worker that connected — running them
+a second time, and for a background job without the client ever finding out.
+The count is bounded by the concurrency limit, so a worker at its cap re-runs
+exactly that many jobs on every restart.
+
+That is not academic. In the pipeline this fork is maintained for, a `SIGTERM`
+under load re-queued exactly 64 jobs — the configured cap — whose rows were
+already committed to MySQL; the redelivery then collided on a primary key,
+MySQL rejected the entire multi-row `INSERT` those rows shared, and 1.1% of all
+events were lost across the restart.
+
+The fix ([`494d20b`](https://github.com/nook24/gearman-go/commit/494d20b)):
+`Close()` now sets a `draining` flag first, which stops new jobs from starting
+and stops asking the servers for more, while the connections stay open and
+`running` stays true. It waits for the jobs already in flight — so they can
+report their result — and only then clears `running` and disconnects. The wait
+is bounded by `DrainTimeout` (30s, a `var` so callers can shorten it), because
+a handler that never returns must not turn a shutdown into a hang; on expiry
+`ErrDrainTimeout` goes to the `ErrorHandler` and the old behaviour applies.
+
+### A data race on the job channel
+
+The one that started the fork. `Close()` closed the `worker.in` channel while
+the per-connection agent goroutines were still sending job packets on it. The
+race detector flags this
 reliably, and losing the race means a `send on closed channel` panic on a
 goroutine the caller does not own and therefore cannot recover from. In
 practice `agent.work` recovers it into `ErrorHandler`, so it usually costs one
@@ -46,12 +79,26 @@ The fix ([`7118c0a`](https://github.com/nook24/gearman-go/commit/7118c0a)):
   the worker mutex but read by `exec` on the job goroutines without it — a
   second race, previously masked by the first.
 
+### A test flag that disabled the tests it gated
+
+`-integration` was read before it was parsed: `TestMain` dereferenced the
+pointer `flag.Bool` returns straight away, but `m.Run` is what calls
+`flag.Parse`. The value was therefore always the default, and every integration
+test in the `worker` package skipped no matter what was passed on the command
+line — including in CI, which had been passing the flag all along. Fixed in
+[`2504393`](https://github.com/nook24/gearman-go/commit/2504393); running those
+tests for the first time immediately turned up a data race on `Worker.ready`,
+fixed in [`b866d45`](https://github.com/nook24/gearman-go/commit/b866d45).
+
 Beyond that, the fork adds a `go.mod` so it can be consumed as a module, keeps
 CI running (see below), and fixes small warts such as the example worker
 depending on an unrelated third-party package.
 
-**There are no API changes.** This is a drop-in replacement for the upstream
-package; the goal is maintenance, not new features.
+**There are no breaking API changes.** This is a drop-in replacement for the
+upstream package; the goal is maintenance, not new features. `v1.1.0` adds two
+exported names, both of them optional: `DrainTimeout` and `ErrDrainTimeout`.
+Existing code compiles and behaves as before, except that `Close()` now waits
+for running jobs instead of abandoning them.
 
 ## Installation
 
@@ -65,7 +112,7 @@ your `go.mod`:
 
 	require github.com/mikespook/gearman-go v0.0.0-... // keep whatever you have
 
-	replace github.com/mikespook/gearman-go => github.com/nook24/gearman-go v1.0.0
+	replace github.com/mikespook/gearman-go => github.com/nook24/gearman-go v1.1.0
 
 To pick up a newer release later:
 
@@ -158,8 +205,10 @@ for the worker package only.
 ## Status and maintenance
 
 The library has been in production use for over six years. The API is stable
-and is not going to change here, which is what `v1.0.0` — the first tagged
-release, upstream never had any — is meant to say.
+and existing code will not be broken here, which is what `v1.0.0` — the first
+tagged release, upstream never had any — was meant to say. `v1.1.0` keeps that
+promise: it fixes the acknowledgement bug above and adds two optional names,
+nothing else.
 
 * Bug fixes: yes, especially anything the race detector finds.
 * New features: unlikely, but issues and pull requests are welcome.
@@ -167,6 +216,18 @@ release, upstream never had any — is meant to say.
   merged in.
 
 ## Changes in this fork
+
+### v1.1.0
+
+* [`494d20b`](https://github.com/nook24/gearman-go/commit/494d20b) — let jobs
+  that are still running acknowledge before `Close` disconnects, so the server
+  stops handing them out a second time.
+* [`b866d45`](https://github.com/nook24/gearman-go/commit/b866d45) — make
+  `Worker.ready` an `atomic.Bool`.
+* [`2504393`](https://github.com/nook24/gearman-go/commit/2504393) — make the
+  `-integration` flag actually enable the integration tests.
+
+### v1.0.0
 
 * [`7118c0a`](https://github.com/nook24/gearman-go/commit/7118c0a) — fix two
   data races in `Worker.Close`.
